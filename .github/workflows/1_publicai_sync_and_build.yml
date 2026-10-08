@@ -150,7 +150,14 @@ jobs:
 
       - name: Install test dependencies
         run: |
-          uv sync --frozen --group ci --extra proxy --extra google
+          uv sync --frozen --group ci --group proxy-dev --extra proxy --extra extra_proxy --extra google
+
+      - name: Cache Prisma binaries
+        uses: ./.github/actions/cache-prisma-binaries
+
+      - name: Generate Prisma client
+        run: |
+          uv run --no-sync prisma generate --schema litellm/proxy/schema.prisma
 
       - name: Run targeted tests for merged changes
         run: |
