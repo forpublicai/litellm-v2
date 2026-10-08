@@ -79,6 +79,11 @@ on:
         required: false
         type: string
         default: ""
+      ref:
+        description: "Git ref or branch to check out"
+        required: false
+        type: string
+        default: ""
 permissions:
   contents: read
 
@@ -103,6 +108,7 @@ jobs:
         timeout-minutes: 3
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || '' }}
 
       - name: Detect relevant changes
         id: changes

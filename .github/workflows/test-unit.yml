@@ -1,6 +1,14 @@
 name: "Unit Tests"
 
 on:
+  # Allows invocation as a reusable workflow from release / sync pipelines (e.g. 1_publicai_sync_and_build.yml)
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref or branch to check out and test (defaults to workflow trigger ref/commit)"
+        required: false
+        type: string
+        default: ""
   pull_request:
     branches:
       - main
@@ -48,6 +56,7 @@ jobs:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || '' }}
 
       - name: Detect relevant changes
         id: changes
@@ -498,3 +507,4 @@ jobs:
       job-timeout-minutes: ${{ matrix.job-timeout-minutes }}
       dist: ${{ matrix.dist || 'loadscope' }}
       artifact-name: ${{ matrix.artifact-name }}
+      ref: ${{ inputs.ref || '' }}
