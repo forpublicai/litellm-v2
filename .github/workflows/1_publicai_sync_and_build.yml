@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      workflows: write
+      actions: write
     outputs:
       changes: ${{ steps.check-sync.outputs.changes }}
       upstream_tag: ${{ steps.get-upstream-tag.outputs.upstream_tag }}
