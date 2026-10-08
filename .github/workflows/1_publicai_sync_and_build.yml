@@ -214,7 +214,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile.helper
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           pull: true
           push: true
           tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/local-base:latest
@@ -241,4 +241,4 @@ jobs:
             ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.sync-and-release.outputs.release_tag }}
             ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
           labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
