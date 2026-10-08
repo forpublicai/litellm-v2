@@ -22,7 +22,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      actions: write
     outputs:
       changes: ${{ steps.check-sync.outputs.changes }}
       upstream_tag: ${{ steps.get-upstream-tag.outputs.upstream_tag }}
@@ -91,7 +90,8 @@ jobs:
           git fetch upstream tag "$UPSTREAM_TAG" --no-tags
           git fetch origin pai/multiple-request-ids pai/mistral-fix
 
-      # Re-create a clean release branch from upstream tag and cleanly merge our two branches
+      # Re-create a clean release branch from upstream tag, merge our two branches,
+      # and align .github/workflows with origin/main so standard GITHUB_TOKEN can push without workflow-scope errors.
       - name: Create release branch and merge customizations
         if: steps.check-sync.outputs.changes == 'true' || github.event_name == 'workflow_dispatch'
         run: |
@@ -102,6 +102,13 @@ jobs:
           git checkout -B "$RELEASE_BRANCH" "$UPSTREAM_TAG"
           git merge --no-edit origin/pai/multiple-request-ids
           git merge --no-edit origin/pai/mistral-fix
+
+          # Keep workflow files aligned with main to avoid GitHub pre-receive hook rejecting pushes that alter workflows without 'workflow' token scope
+          git checkout origin/main -- .github/workflows
+          if ! git diff --quiet --cached -- .github/workflows || ! git diff --quiet -- .github/workflows; then
+            git add .github/workflows
+            git commit -m "chore: align workflows with main for release build"
+          fi
 
           git tag -f "$RELEASE_TAG"
 
