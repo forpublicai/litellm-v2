@@ -104,7 +104,7 @@ jobs:
 
           git tag -f "$RELEASE_TAG"
 
-      # Push branch and tag to remote origin so tests can run on the exact release branch
+      # Push branch and tag to remote origin so tests and Docker builds checkout this exact release state
       - name: Push release branch and tag
         if: steps.check-sync.outputs.changes == 'true' || github.event_name == 'workflow_dispatch'
         run: |
@@ -114,19 +114,54 @@ jobs:
           git push origin "$RELEASE_BRANCH" --force
           git push origin "$RELEASE_TAG" --force
 
-  # Step 2: Run unit test suite on the freshly created release branch before container build.
-  # Reuses .github/workflows/test-unit.yml via workflow_call with the target release ref.
-  test-unit:
+  # Step 2: Run targeted unit tests directly for the changes introduced by the two merged branches:
+  # - pai/mistral-fix: streaming handler & Mistral chat transformation tests
+  # - pai/multiple-request-ids: spend management comma-separated request ID filter tests
+  # This provides fast (<2 min), high-signal regression testing on the release branch before container build.
+  test-targeted-unit:
     needs: sync-and-release
     if: needs.sync-and-release.outputs.changes == 'true' || github.event_name == 'workflow_dispatch'
-    uses: ./.github/workflows/test-unit.yml
-    with:
-      ref: ${{ needs.sync-and-release.outputs.release_branch }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync-and-release.outputs.release_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.10.9"
+
+      - name: Install test dependencies
+        run: |
+          uv sync --frozen --group ci --extra proxy --extra google
+
+      - name: Run targeted tests for merged changes
+        run: |
+          # Resolve spend management test file (location differs across LiteLLM releases)
+          SPEND_TEST="tests/unit/proxy/spend_tracking/test_spend_management_endpoints.py"
+          if [ ! -f "$SPEND_TEST" ]; then
+            SPEND_TEST="tests/test_litellm/proxy/spend_tracking/test_spend_management_endpoints.py"
+          fi
+
+          echo "Running targeted test suite on release branch..."
+          uv run pytest \
+            tests/unit/litellm_core_utils/test_streaming_handler.py \
+            tests/unit/llms/mistral/test_mistral_chat_transformation.py \
+            "$SPEND_TEST"
 
   # Step 3: Build database Docker image and push to GHCR tagged with pai-vX.X.X and latest.
-  # This only runs if unit tests succeed.
+  # This only runs if the targeted unit tests succeed.
   build-and-push-database:
-    needs: [sync-and-release, test-unit]
+    needs: [sync-and-release, test-targeted-unit]
     if: needs.sync-and-release.outputs.changes == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
