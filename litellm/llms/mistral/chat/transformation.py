@@ -629,12 +629,19 @@ class MistralChatResponseIterator(OpenAIChatCompletionStreamingHandler):
                 delta = choice.get("delta", {})
                 content = delta.get("content")
                 if isinstance(content, list):
+                    # If the content list contains non-thinking blocks like references,
+                    # retain the full list so citations and grounding parts are preserved.
+                    has_references = any(
+                        isinstance(b, dict) and b.get("type") not in ("thinking", "text")
+                        for b in content
+                    )
                     (
                         normalized_text,
                         thinking_blocks,
                         reasoning_content,
                     ) = self._normalize_content_blocks(content)
-                    delta["content"] = normalized_text
+                    if not has_references:
+                        delta["content"] = normalized_text
                     if thinking_blocks:
                         delta["thinking_blocks"] = thinking_blocks
                         delta["reasoning_content"] = reasoning_content

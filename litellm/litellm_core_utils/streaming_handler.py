@@ -820,7 +820,10 @@ class CustomStreamWrapper:
     ) -> bool:
         if (
             "content" in completion_obj
-            and (isinstance(completion_obj["content"], str) and len(completion_obj["content"]) > 0)
+            and (
+                (isinstance(completion_obj["content"], str) and len(completion_obj["content"]) > 0)
+                or (isinstance(completion_obj["content"], list) and len(completion_obj["content"]) > 0)
+            )
             or (
                 "tool_calls" in completion_obj
                 and completion_obj["tool_calls"] is not None
@@ -1800,7 +1803,16 @@ class CustomStreamWrapper:
                     if response.choices:
                         choice = response.choices[0]
                         if isinstance(choice, StreamingChoices):
-                            self.response_uptil_now += choice.delta.get("content", "") or ""
+                            _delta_content = choice.delta.get("content", "") or ""
+                            if isinstance(_delta_content, list):
+                                _text_delta = "".join(
+                                    item.get("text", "") if isinstance(item, dict) else str(item)
+                                    for item in _delta_content
+                                    if not isinstance(item, dict) or item.get("type") == "text"
+                                )
+                                self.response_uptil_now += _text_delta
+                            elif isinstance(_delta_content, str):
+                                self.response_uptil_now += _delta_content
                         else:
                             self.response_uptil_now += ""
                     self.rules.post_call_rules(input=self.response_uptil_now, model=self.model)
@@ -2000,7 +2012,16 @@ class CustomStreamWrapper:
                     if processed_chunk.choices:
                         choice = processed_chunk.choices[0]
                         if isinstance(choice, StreamingChoices):
-                            self.response_uptil_now += choice.delta.get("content", "") or ""
+                            _delta_content = choice.delta.get("content", "") or ""
+                            if isinstance(_delta_content, list):
+                                _text_delta = "".join(
+                                    item.get("text", "") if isinstance(item, dict) else str(item)
+                                    for item in _delta_content
+                                    if not isinstance(item, dict) or item.get("type") == "text"
+                                )
+                                self.response_uptil_now += _text_delta
+                            elif isinstance(_delta_content, str):
+                                self.response_uptil_now += _delta_content
                         else:
                             self.response_uptil_now += ""
                     self.rules.post_call_rules(input=self.response_uptil_now, model=self.model)
@@ -2066,7 +2087,16 @@ class CustomStreamWrapper:
 
                         choice = processed_chunk.choices[0]
                         if isinstance(choice, StreamingChoices):
-                            self.response_uptil_now += choice.delta.get("content", "") or ""
+                            _delta_content = choice.delta.get("content", "") or ""
+                            if isinstance(_delta_content, list):
+                                _text_delta = "".join(
+                                    item.get("text", "") if isinstance(item, dict) else str(item)
+                                    for item in _delta_content
+                                    if not isinstance(item, dict) or item.get("type") == "text"
+                                )
+                                self.response_uptil_now += _text_delta
+                            elif isinstance(_delta_content, str):
+                                self.response_uptil_now += _delta_content
                         else:
                             self.response_uptil_now += ""
                         self.rules.post_call_rules(input=self.response_uptil_now, model=self.model)

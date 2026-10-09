@@ -481,6 +481,40 @@ def test_mistral_streaming_chunk_preserves_thinking_blocks():
     assert delta.content == " Hello"
 
 
+def test_mistral_streaming_chunk_preserves_reference_and_grounding_blocks():
+    """Ensure streaming chunks preserve content list containing references and web grounding parts."""
+    iterator = MistralChatResponseIterator(
+        streaming_response=iter([]), sync_stream=True, json_mode=False
+    )
+
+    streamed_chunk = {
+        "id": "chunk-grounded-1",
+        "object": "chat.completion.chunk",
+        "created": 123456,
+        "model": "mistral-large-2512",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "content": [
+                        {"type": "text", "text": "According to recent findings "},
+                        {"type": "reference", "reference": {"url": "https://example.com/source"}},
+                    ],
+                },
+                "finish_reason": None,
+            }
+        ],
+    }
+
+    parsed_chunk = iterator.chunk_parser(streamed_chunk)
+    delta = parsed_chunk.choices[0].delta
+    # Content list with references should be preserved as-is
+    assert isinstance(delta.content, list)
+    assert len(delta.content) == 2
+    assert delta.content[0] == {"type": "text", "text": "According to recent findings "}
+    assert delta.content[1] == {"type": "reference", "reference": {"url": "https://example.com/source"}}
+
+
 class TestMistralNameHandling:
     """Test suite for Mistral name handling in messages."""
 
