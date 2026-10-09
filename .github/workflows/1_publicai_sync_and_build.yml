@@ -1,0 +1,224 @@
+name: 1 Public AI Sync Upstream and Build
+
+on:
+  schedule:
+    # Run daily at midnight UTC
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream tag to build from (leave empty to use latest stable upstream tag, e.g. v1.104.2)"
+        required: false
+        default: ""
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: litellm-v2
+
+jobs:
+  # Step 1: Discover upstream stable tag, create fresh release branch pai_release/pai-vX.X.X,
+  # and merge customized branches (multiple-request-ids and mistral-fix).
+  sync-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changes: ${{ steps.check-sync.outputs.changes }}
+      upstream_tag: ${{ steps.get-upstream-tag.outputs.upstream_tag }}
+      release_tag: ${{ steps.get-upstream-tag.outputs.release_tag }}
+      release_branch: ${{ steps.get-upstream-tag.outputs.release_branch }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/BerriAI/litellm.git || true
+
+      # Extract latest stable semver tag (vX.X.X) ignoring rc and dev releases
+      - name: Determine upstream tag and release identifiers
+        id: get-upstream-tag
+        run: |
+          if [ -n "${{ github.event.inputs.upstream_tag }}" ]; then
+            UPSTREAM_TAG="${{ github.event.inputs.upstream_tag }}"
+          else
+            LINE=$(git ls-remote --tags upstream | grep -E 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' | sort -t '/' -k 3 -V | tail -n 1)
+            UPSTREAM_TAG=$(echo "$LINE" | awk -F'/' '{print $3}')
+          fi
+
+          if [ -z "$UPSTREAM_TAG" ]; then
+            echo "Failed to determine upstream tag"
+            exit 1
+          fi
+
+          RELEASE_TAG="pai-${UPSTREAM_TAG}"
+          RELEASE_BRANCH="pai_release/${RELEASE_TAG}"
+
+          echo "Upstream tag: $UPSTREAM_TAG"
+          echo "Release tag: $RELEASE_TAG"
+          echo "Release branch: $RELEASE_BRANCH"
+
+          echo "upstream_tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "release_branch=$RELEASE_BRANCH" >> $GITHUB_OUTPUT
+
+      # Skip sync if release tag already exists in origin (unless manually triggered via workflow_dispatch)
+      - name: Check if release tag already exists
+        id: check-sync
+        run: |
+          RELEASE_TAG="${{ steps.get-upstream-tag.outputs.release_tag }}"
+          git fetch origin --tags
+
+          if git rev-parse "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release tag $RELEASE_TAG already exists in our repository. No sync needed."
+            echo "changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "Release tag $RELEASE_TAG is new! Sync needed."
+            echo "changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch branches and tags
+        if: steps.check-sync.outputs.changes == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          UPSTREAM_TAG="${{ steps.get-upstream-tag.outputs.upstream_tag }}"
+          git fetch upstream tag "$UPSTREAM_TAG" --no-tags
+          git fetch origin pai/multiple-request-ids pai/mistral-fix
+
+      # Re-create a clean release branch from upstream tag, merge our two branches,
+      # and align .github/workflows with origin/main so standard GITHUB_TOKEN can push without workflow-scope errors.
+      - name: Create release branch and merge customizations
+        if: steps.check-sync.outputs.changes == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          UPSTREAM_TAG="${{ steps.get-upstream-tag.outputs.upstream_tag }}"
+          RELEASE_TAG="${{ steps.get-upstream-tag.outputs.release_tag }}"
+          RELEASE_BRANCH="${{ steps.get-upstream-tag.outputs.release_branch }}"
+
+          git checkout -B "$RELEASE_BRANCH" "$UPSTREAM_TAG"
+          git merge --no-edit origin/pai/multiple-request-ids
+          git merge --no-edit origin/pai/mistral-fix
+
+          # Keep workflow files aligned with main to avoid GitHub pre-receive hook rejecting pushes that alter workflows without 'workflow' token scope
+          git checkout origin/main -- .github/workflows
+          if ! git diff --quiet --cached -- .github/workflows || ! git diff --quiet -- .github/workflows; then
+            git add .github/workflows
+            git commit -m "chore: align workflows with main for release build"
+          fi
+
+          git tag -f "$RELEASE_TAG"
+
+      # Push branch and tag to remote origin so tests and Docker builds checkout this exact release state
+      - name: Push release branch and tag
+        if: steps.check-sync.outputs.changes == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          RELEASE_TAG="${{ steps.get-upstream-tag.outputs.release_tag }}"
+          RELEASE_BRANCH="${{ steps.get-upstream-tag.outputs.release_branch }}"
+
+          git push origin "$RELEASE_BRANCH" --force
+          git push origin "$RELEASE_TAG" --force
+
+  # Step 2: Run targeted unit tests directly for the changes introduced by the two merged branches:
+  # - pai/mistral-fix: streaming handler & Mistral chat transformation tests
+  # - pai/multiple-request-ids: spend management comma-separated request ID filter tests
+  # This provides fast (<2 min), high-signal regression testing on the release branch before container build.
+  test-targeted-unit:
+    needs: sync-and-release
+    if: needs.sync-and-release.outputs.changes == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync-and-release.outputs.release_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.10.9"
+
+      - name: Install test dependencies
+        run: |
+          uv sync --frozen --group ci --group proxy-dev --extra proxy --extra extra_proxy --extra google
+
+      - name: Cache Prisma binaries
+        uses: ./.github/actions/cache-prisma-binaries
+
+      - name: Generate Prisma client
+        run: |
+          uv run --no-sync prisma generate --schema litellm/proxy/schema.prisma
+
+      - name: Run targeted tests for merged changes
+        run: |
+          # Resolve spend management test file (location differs across LiteLLM releases)
+          SPEND_TEST="tests/unit/proxy/spend_tracking/test_spend_management_endpoints.py"
+          if [ ! -f "$SPEND_TEST" ]; then
+            SPEND_TEST="tests/test_litellm/proxy/spend_tracking/test_spend_management_endpoints.py"
+          fi
+
+          echo "Running targeted test suite on release branch..."
+          uv run pytest \
+            tests/unit/litellm_core_utils/test_streaming_handler.py \
+            tests/unit/llms/mistral/test_mistral_chat_transformation.py \
+            "$SPEND_TEST"
+
+  # Step 3: Build database Docker image and push to GHCR tagged with pai-vX.X.X and latest.
+  # This only runs if the targeted unit tests succeed.
+  build-and-push-database:
+    needs: [sync-and-release, test-targeted-unit]
+    if: needs.sync-and-release.outputs.changes == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout merged release code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync-and-release.outputs.release_branch }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+
+      # Build the production database image with LITELLM_RELEASE_TAG=pai-vX.X.X
+      - name: Build and push Database Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.database
+          pull: true
+          push: true
+          build-args: |
+            LITELLM_RELEASE_TAG=${{ needs.sync-and-release.outputs.release_tag }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.sync-and-release.outputs.release_tag }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
