@@ -123,8 +123,11 @@ def _reconstruct_ui_where_from_sql(sql_query, params):
         status = re.fullmatch(r"status = \$(\d+)", cond)
         api_key_not_in = re.fullmatch(r"api_key NOT IN \(\$(\d+), \$(\d+)\)", cond)
         req_or_call = re.fullmatch(r"\(request_id = \$(\d+) OR litellm_call_id = \$\1\)", cond)
+        req_in = re.fullmatch(r"request_id = ANY\(\$(\d+)::text\[\]\)", cond)
         if req_or_call:
             where["request_id_or_call_id"] = params[int(req_or_call.group(1)) - 1]
+        elif req_in:
+            where["request_id"] = {"in": params[int(req_in.group(1)) - 1]}
         elif gte:
             date_bounds["gte"] = _iso(params[int(gte.group(1)) - 1])
         elif lte:
@@ -2414,6 +2417,86 @@ async def test_ui_view_spend_logs_request_id_lookup_matches_litellm_call_id(clie
         data = response.json()
         assert data["total"] == 1
         assert data["data"][0]["request_id"] == "chatcmpl-9ZKMURhVYSi9D6r6PJ9vLcayIK0Vm"
+    finally:
+        app.dependency_overrides.pop(ps.user_api_key_auth, None)
+
+
+@pytest.mark.asyncio
+async def test_ui_view_spend_logs_with_request_ids(client, monkeypatch):
+    """Test the /spend/logs/v2 and /spend/logs/ui endpoints with multiple request_ids filter"""
+    today = datetime.datetime.now(timezone.utc)
+    mock_spend_logs = [
+        {
+            "id": "log1",
+            "request_id": "req1",
+            "spend": 0.05,
+            "startTime": today.isoformat(),
+        },
+        {
+            "id": "log2",
+            "request_id": "req2",
+            "spend": 0.10,
+            "startTime": today.isoformat(),
+        },
+        {
+            "id": "log3",
+            "request_id": "req3",
+            "spend": 0.15,
+            "startTime": today.isoformat(),
+        },
+    ]
+
+    def filter_fn(where):
+        req_filter = where.get("request_id")
+        if isinstance(req_filter, dict) and "in" in req_filter:
+            return [log for log in mock_spend_logs if log["request_id"] in req_filter["in"]]
+        return list(mock_spend_logs)
+
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.prisma_client",
+        make_ui_spend_logs_mock_prisma(mock_spend_logs, filter_fn),
+    )
+
+    start_date = (today - datetime.timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    end_date = today.strftime("%Y-%m-%d %H:%M:%S")
+
+    app.dependency_overrides[ps.user_api_key_auth] = lambda: UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN)
+    try:
+        response = client.get(
+            "/spend/logs/v2",
+            params={
+                "request_ids": "req1,req2",
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+
+        assert "data" in data
+        assert "total" in data
+        assert "page" in data
+
+        assert data["total"] == 2
+        assert len(data["data"]) == 2
+        returned_ids = {log["request_id"] for log in data["data"]}
+        assert returned_ids == {"req1", "req2"}
+
+        ui_response = client.get(
+            "/spend/logs/ui",
+            params={
+                "request_ids": "req2,req3, ",
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        assert ui_response.status_code == 200
+        ui_data = ui_response.json()
+        assert ui_data["total"] == 2
+        assert {log["request_id"] for log in ui_data["data"]} == {"req2", "req3"}
     finally:
         app.dependency_overrides.pop(ps.user_api_key_auth, None)
 
