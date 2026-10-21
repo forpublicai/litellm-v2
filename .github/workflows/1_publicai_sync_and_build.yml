@@ -1,9 +1,6 @@
 name: 1 Public AI Sync Upstream and Build
 
 on:
-  schedule:
-    # Run daily at midnight UTC
-    - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
       upstream_tag:
@@ -88,7 +85,7 @@ jobs:
         run: |
           UPSTREAM_TAG="${{ steps.get-upstream-tag.outputs.upstream_tag }}"
           git fetch upstream tag "$UPSTREAM_TAG" --no-tags
-          git fetch origin pai/multiple-request-ids pai/mistral-fix
+          git fetch origin pai/multiple-request-ids pai/mistral-fix pai/fix-llm-execptions-slack-alerting
 
       # Re-create a clean release branch from upstream tag, merge our two branches,
       # and align .github/workflows with origin/main so standard GITHUB_TOKEN can push without workflow-scope errors.
@@ -102,6 +99,7 @@ jobs:
           git checkout -B "$RELEASE_BRANCH" "$UPSTREAM_TAG"
           git merge --no-edit origin/pai/multiple-request-ids
           git merge --no-edit origin/pai/mistral-fix
+          git merge --no-edit origin/pai/fix-llm-execptions-slack-alerting
 
           # Keep workflow files aligned with main to avoid GitHub pre-receive hook rejecting pushes that alter workflows without 'workflow' token scope
           git checkout origin/main -- .github/workflows
