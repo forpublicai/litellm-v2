@@ -1409,9 +1409,64 @@ class TestPostCallFailureHookLLMExceptionAlerting:
         assert alerting_handler.called is True
 
     @pytest.mark.asyncio
-    async def test_http_exception_429_does_not_alert(self):
+    async def test_http_exception_429_alerts(self):
         alerting_handler = await self._alerted(HTTPException(status_code=429, detail="rate limited"))
+        assert alerting_handler.called is True
+
+    @pytest.mark.asyncio
+    async def test_http_exception_403_alerts(self):
+        alerting_handler = await self._alerted(HTTPException(status_code=403, detail="forbidden"))
+        assert alerting_handler.called is True
+
+    @pytest.mark.asyncio
+    async def test_proxy_exception_429_alerts(self):
+        from litellm.proxy._types import ProxyException
+
+        alerting_handler = await self._alerted(
+            ProxyException(
+                message="rate limit reached",
+                type="rate_limit_error",
+                param=None,
+                code=429,
+            )
+        )
+        assert alerting_handler.called is True
+
+    @pytest.mark.asyncio
+    async def test_proxy_exception_403_alerts(self):
+        from litellm.proxy._types import ProxyException
+
+        alerting_handler = await self._alerted(
+            ProxyException(
+                message="forbidden access",
+                type="permission_denied_error",
+                param=None,
+                code=403,
+            )
+        )
+        assert alerting_handler.called is True
+
+    @pytest.mark.asyncio
+    async def test_bad_request_error_does_not_alert(self):
+        from litellm.exceptions import BadRequestError
+
+        exc = BadRequestError(
+            message="Invalid prompt",
+            model="gpt-4o",
+            llm_provider="openai",
+        )
+        alerting_handler = await self._alerted(exc)
         assert alerting_handler.called is False
+
+    @pytest.mark.asyncio
+    async def test_json_decode_error_does_not_alert(self):
+        import json
+
+        try:
+            json.loads("invalid json {")
+        except json.JSONDecodeError as exc:
+            alerting_handler = await self._alerted(exc)
+            assert alerting_handler.called is False
 
 
 class TestPostCallFailureHookProxyExceptionLogging:

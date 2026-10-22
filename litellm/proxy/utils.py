@@ -124,6 +124,7 @@ from litellm._service_logger import ServiceLogging, ServiceTypes
 from litellm.caching.caching import DualCache, RedisCache
 from litellm.caching.dual_cache import LimitedSizeOrderedDict
 from litellm.exceptions import (
+    BadRequestError,
     GuardrailRaisedException,
     RejectedRequestError,
     SensitiveDataRouteException,
@@ -523,10 +524,31 @@ class _StreamIteratorHook(Protocol[_T]):
 
 
 def _is_client_error_exception(exc: Exception) -> bool:
+    if isinstance(exc, (BadRequestError, ValidationError, json.JSONDecodeError)):
+        return True
+
+    status_code: Optional[int] = None
     if isinstance(exc, HTTPException):
-        return exc.status_code < 500
-    if isinstance(exc, ProxyException):
-        return not (exc.code.isdigit() and int(exc.code) >= 500)
+        status_code = exc.status_code
+    elif isinstance(exc, ProxyException):
+        code_str = str(exc.code)
+        if code_str.isdigit():
+            status_code = int(code_str)
+    else:
+        raw_status = getattr(exc, "status_code", None)
+        if raw_status is not None and not isinstance(raw_status, bool):
+            try:
+                status_code = int(str(raw_status))
+            except (ValueError, TypeError):
+                pass
+
+    if status_code is not None:
+        # Errors like 401/403 (unauthorized/forbidden) or 429 (rate limits) should alert
+        if status_code in (401, 403, 429):
+            return False
+        # Other 4xx errors (e.g. 400 Bad Request, 404, 422) are client errors and should not alert
+        return 400 <= status_code < 500
+
     return False
 
 
