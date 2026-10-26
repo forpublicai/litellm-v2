@@ -4983,3 +4983,49 @@ async def test_async_stream_without_usage_counts_tokens_off_the_event_loop():
     assert chunks[-1].usage.prompt_tokens > 100_000
     assert chunks[-1].usage.completion_tokens > 100_000
     assert_loop_stayed_free(took, lags)
+
+
+@pytest.mark.asyncio
+async def test_custom_stream_wrapper_handles_list_content_deltas():
+    from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+    from litellm.types.utils import ModelResponseStream, StreamingChoices, Delta
+    from unittest.mock import MagicMock
+
+    log_obj = MagicMock()
+    log_obj.model_call_details = {"litellm_params": {}}
+    log_obj.completion_start_time = None
+    log_obj._update_completion_start_time = MagicMock()
+
+    chunk1 = ModelResponseStream(
+        id="chatcmpl-test-1",
+        choices=[StreamingChoices(index=0, delta=Delta(role="assistant", content=[{"type": "text", "text": "Paris is "}, {"type": "reference", "url": "http://example.com"}]), finish_reason=None)]
+    )
+    chunk2 = ModelResponseStream(
+        id="chatcmpl-test-2",
+        choices=[StreamingChoices(index=0, delta=Delta(content=[{"type": "text", "text": "the capital."}, {"type": "reference", "url": "http://example.com"}]), finish_reason=None)]
+    )
+    chunk3 = ModelResponseStream(
+        id="chatcmpl-test-3",
+        choices=[StreamingChoices(index=0, delta=Delta(), finish_reason="stop")]
+    )
+
+    async def async_iter():
+        yield chunk1
+        yield chunk2
+        yield chunk3
+
+    handler = CustomStreamWrapper(
+        completion_stream=async_iter(),
+        model="mistralai/mistral-large-2512",
+        custom_llm_provider="openai",
+        logging_obj=log_obj
+    )
+    received = []
+    async for c in handler:
+        received.append(c)
+
+    assert len(received) == 3
+    assert received[0].choices[0].delta.content == [{"type": "text", "text": "Paris is "}, {"type": "reference", "url": "http://example.com"}]
+    assert received[1].choices[0].delta.content == [{"type": "text", "text": "the capital."}, {"type": "reference", "url": "http://example.com"}]
+    assert received[2].choices[0].finish_reason == "stop"
+    assert handler.response_uptil_now == "Paris is the capital."
