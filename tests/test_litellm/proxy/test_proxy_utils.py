@@ -1338,7 +1338,7 @@ class TestPostCallFailureHookLLMExceptionAlerting:
     client errors must be excluded so a guardrail content-policy block never
     pages on-call. 5xx proxy errors still alert."""
 
-    async def _alerted(self, exc: Exception) -> AsyncMock:
+    async def _alerted(self, exc: Exception, error_type: ProxyErrorTypes | None = None) -> AsyncMock:
         import asyncio
 
         from litellm.proxy._types import AlertType, UserAPIKeyAuth
@@ -1354,6 +1354,7 @@ class TestPostCallFailureHookLLMExceptionAlerting:
                 request_data={},
                 original_exception=exc,
                 user_api_key_dict=UserAPIKeyAuth(),
+                error_type=error_type,
             )
         await asyncio.sleep(0)  # let the fire-and-forget alert task run
         return alerting_handler
@@ -1409,17 +1410,17 @@ class TestPostCallFailureHookLLMExceptionAlerting:
         assert alerting_handler.called is True
 
     @pytest.mark.asyncio
-    async def test_http_exception_429_alerts(self):
+    async def test_http_exception_429_does_not_alert(self):
         alerting_handler = await self._alerted(HTTPException(status_code=429, detail="rate limited"))
-        assert alerting_handler.called is True
+        assert alerting_handler.called is False
 
     @pytest.mark.asyncio
-    async def test_http_exception_403_alerts(self):
+    async def test_http_exception_403_does_not_alert(self):
         alerting_handler = await self._alerted(HTTPException(status_code=403, detail="forbidden"))
-        assert alerting_handler.called is True
+        assert alerting_handler.called is False
 
     @pytest.mark.asyncio
-    async def test_proxy_exception_429_alerts(self):
+    async def test_proxy_exception_429_does_not_alert(self):
         from litellm.proxy._types import ProxyException
 
         alerting_handler = await self._alerted(
@@ -1430,10 +1431,10 @@ class TestPostCallFailureHookLLMExceptionAlerting:
                 code=429,
             )
         )
-        assert alerting_handler.called is True
+        assert alerting_handler.called is False
 
     @pytest.mark.asyncio
-    async def test_proxy_exception_403_alerts(self):
+    async def test_proxy_exception_403_does_not_alert(self):
         from litellm.proxy._types import ProxyException
 
         alerting_handler = await self._alerted(
@@ -1444,6 +1445,114 @@ class TestPostCallFailureHookLLMExceptionAlerting:
                 code=403,
             )
         )
+        assert alerting_handler.called is False
+
+    @pytest.mark.asyncio
+    async def test_model_access_denied_proxy_exception_does_not_alert(self):
+        from litellm.proxy._types import ModelAccessDeniedProxyException
+
+        exc = ModelAccessDeniedProxyException(
+            message=(
+                "The requested model 'swiss-ai/Apertus-8B-Instruct-2509' is not available for this API key, "
+                "or the model name is invalid. Check the models available to you and try again."
+            ),
+            internal_message="Key not allowed to access model",
+            type="key_model_access_denied",
+            param="model",
+            code=403,
+        )
+        alerting_handler = await self._alerted(exc)
+        assert alerting_handler.called is False
+
+    @pytest.mark.asyncio
+    async def test_model_access_denied_http_exception_does_not_alert(self):
+        from litellm.proxy.auth.model_access_denied import ModelAccessDeniedHTTPException
+
+        exc = ModelAccessDeniedHTTPException(
+            internal_message="Key not allowed to access model",
+            status_code=403,
+            detail=(
+                "The requested model 'publicai/aisingapore/Qwen-SEA-LION-v4-32B-IT' is not available for this API key, "
+                "or the model name is invalid. Check the models available to you and try again."
+            ),
+        )
+        alerting_handler = await self._alerted(exc)
+        assert alerting_handler.called is False
+
+    @pytest.mark.asyncio
+    async def test_no_api_key_passed_in_does_not_alert(self):
+        from litellm.proxy._types import ProxyErrorTypes
+
+        exc = Exception("No api key passed in.")
+        alerting_handler_auth_error = await self._alerted(exc, error_type=ProxyErrorTypes.auth_error)
+        assert alerting_handler_auth_error.called is False
+
+        alerting_handler_bare = await self._alerted(exc)
+        assert alerting_handler_bare.called is False
+
+    @pytest.mark.asyncio
+    async def test_proxy_rate_limit_error_does_not_alert(self):
+        from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
+
+        exc = ProxyRateLimitError(
+            detail="LiteLLM rate limit reached for key",
+        )
+        alerting_handler = await self._alerted(exc)
+        assert alerting_handler.called is False
+
+    @pytest.mark.asyncio
+    async def test_budget_exceeded_error_does_not_alert(self):
+        from litellm.exceptions import BudgetExceededError
+
+        exc = BudgetExceededError(
+            current_cost=10.5,
+            max_budget=10.0,
+            message="Budget has been exceeded",
+        )
+        alerting_handler = await self._alerted(exc)
+        assert alerting_handler.called is False
+
+    @pytest.mark.asyncio
+    async def test_vendor_rate_limit_alerts(self):
+        from litellm.exceptions import RateLimitError, RateLimitErrorCategory
+
+        exc = RateLimitError(
+            message="Rate limit reached on OpenAI",
+            llm_provider="openai",
+            model="gpt-4o",
+            category=RateLimitErrorCategory.VENDOR_RATE_LIMIT,
+        )
+        alerting_handler = await self._alerted(exc)
+        assert alerting_handler.called is True
+
+    @pytest.mark.asyncio
+    async def test_vendor_auth_failure_alerts(self):
+        from litellm.exceptions import AuthenticationError
+
+        exc = AuthenticationError(
+            message="Invalid API Key provided to upstream OpenAI",
+            llm_provider="openai",
+            model="gpt-4o",
+        )
+        alerting_handler = await self._alerted(exc)
+        assert alerting_handler.called is True
+
+    @pytest.mark.asyncio
+    async def test_vendor_permission_denied_alerts(self):
+        import httpx
+
+        from litellm.exceptions import PermissionDeniedError
+
+        exc = PermissionDeniedError(
+            message="Upstream Anthropic project does not have access to claude-3-opus",
+            llm_provider="anthropic",
+            model="claude-3-opus",
+            response=httpx.Response(
+                status_code=403,
+                request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+            ),
+        )
+        alerting_handler = await self._alerted(exc)
         assert alerting_handler.called is True
 
     @pytest.mark.asyncio

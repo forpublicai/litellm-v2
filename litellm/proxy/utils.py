@@ -66,17 +66,20 @@ from litellm.litellm_core_utils.bug_report import (
 )
 from litellm.proxy._types import (
     CommonProxyErrors,
+    ModelAccessDeniedProxyException,
     ProxyErrorTypes,
     ProxyException,
     SpendLogsMetadata,
     SpendLogsPayload,
 )
+from litellm.proxy.auth.model_access_denied import ModelAccessDeniedHTTPException
 from litellm.proxy.bug_report_config import build_proxy_bug_report
 from litellm.proxy.common_utils.openai_error_payload import (
     litellm_call_id_headers,
     openai_error_param,
     with_litellm_call_id,
 )
+from litellm.proxy.common_utils.proxy_rate_limit_error import ProxyRateLimitError
 from litellm.proxy.spend_tracking.spend_log_error_logger import spend_log_error
 from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.proxy.model_listing import ModelInfoResponse
@@ -124,8 +127,13 @@ from litellm._service_logger import ServiceLogging, ServiceTypes
 from litellm.caching.caching import DualCache, RedisCache
 from litellm.caching.dual_cache import LimitedSizeOrderedDict
 from litellm.exceptions import (
+    AuthenticationError,
     BadRequestError,
+    BudgetExceededError,
     GuardrailRaisedException,
+    PermissionDeniedError,
+    RateLimitError,
+    RateLimitErrorCategory,
     RejectedRequestError,
     SensitiveDataRouteException,
 )
@@ -523,31 +531,101 @@ class _StreamIteratorHook(Protocol[_T]):
     def __call__(self, *, response: AsyncIterator[_T]) -> AsyncGenerator[_T, None]: ...
 
 
-def _is_client_error_exception(exc: Exception) -> bool:
+_CLIENT_PROXY_ERROR_TYPE_VALUES: Final = frozenset(
+    (
+        ProxyErrorTypes.budget_exceeded.value,
+        ProxyErrorTypes.token_not_found_in_db.value,
+        ProxyErrorTypes.key_model_access_denied.value,
+        ProxyErrorTypes.team_model_access_denied.value,
+        ProxyErrorTypes.user_model_access_denied.value,
+        ProxyErrorTypes.org_model_access_denied.value,
+        ProxyErrorTypes.project_model_access_denied.value,
+        ProxyErrorTypes.agent_model_access_denied.value,
+        ProxyErrorTypes.expired_key.value,
+        ProxyErrorTypes.auth_error.value,
+        ProxyErrorTypes.bad_request_error.value,
+        ProxyErrorTypes.validation_error.value,
+    )
+)
+
+
+def _is_client_proxy_error_type(error_type: object) -> bool:
+    if error_type is None:
+        return False
+    error_type_val: Final = error_type.value if isinstance(error_type, ProxyErrorTypes) else str(error_type)
+    return error_type_val in _CLIENT_PROXY_ERROR_TYPE_VALUES
+
+
+def _extract_status_code(exc: Exception) -> int | None:
+    if isinstance(exc, HTTPException):
+        return exc.status_code
+    if isinstance(exc, ProxyException):
+        code_str: Final = str(exc.code)
+        if code_str.isdigit():
+            return int(code_str)
+        return None
+    raw_status: Final[object] = getattr(exc, "status_code", None)
+    if raw_status is not None and not isinstance(raw_status, bool):
+        try:
+            return int(str(raw_status))
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _is_client_error_exception(
+    exc: Exception,
+    error_type: ProxyErrorTypes | str | None = None,
+) -> bool:
     if isinstance(exc, (BadRequestError, ValidationError, json.JSONDecodeError)):
         return True
 
-    status_code: Optional[int] = None
-    if isinstance(exc, HTTPException):
-        status_code = exc.status_code
-    elif isinstance(exc, ProxyException):
-        code_str = str(exc.code)
-        if code_str.isdigit():
-            status_code = int(code_str)
-    else:
-        raw_status = getattr(exc, "status_code", None)
-        if raw_status is not None and not isinstance(raw_status, bool):
-            try:
-                status_code = int(str(raw_status))
-            except (ValueError, TypeError):
-                pass
+    if _is_client_proxy_error_type(error_type) or _is_client_proxy_error_type(getattr(exc, "type", None)):
+        return True
 
+    if isinstance(exc, (ModelAccessDeniedProxyException, ModelAccessDeniedHTTPException)):
+        return True
+
+    if isinstance(exc, (ProxyRateLimitError, BudgetExceededError)):
+        return True
+
+    category: Final[object] = getattr(exc, "category", None)
+    if category in (
+        RateLimitErrorCategory.LITELLM_RATE_LIMIT.value,
+        RateLimitErrorCategory.LITELLM_BATCH_RATE_LIMIT.value,
+        "litellm_rate_limit",
+        "litellm_batch_rate_limit",
+    ):
+        return True
+    if category in (
+        RateLimitErrorCategory.VENDOR_RATE_LIMIT.value,
+        RateLimitErrorCategory.VENDOR_BATCH_RATE_LIMIT.value,
+        "vendor_rate_limit",
+        "vendor_batch_rate_limit",
+    ):
+        return False
+
+    if isinstance(exc, (AuthenticationError, PermissionDeniedError, RateLimitError)):
+        return False
+
+    status_code: Final[int | None] = _extract_status_code(exc)
     if status_code is not None:
-        # Errors like 401/403 (unauthorized/forbidden) or 429 (rate limits) should alert
-        if status_code in (401, 403, 429):
+        if status_code >= 500:
             return False
-        # Other 4xx errors (e.g. 400 Bad Request, 404, 422) are client errors and should not alert
+        if getattr(exc, "llm_provider", None) and status_code in (401, 403, 429):
+            return False
         return 400 <= status_code < 500
+
+    exc_message: Final = str(exc)
+    if (
+        "No api key passed in" in exc_message
+        or "Malformed API Key passed in" in exc_message
+        or "Invalid proxy server token passed" in exc_message
+        or "Key is blocked" in exc_message
+        or exc_message.startswith("Authentication Error")
+        or "is not available for this API key, or the model name is invalid" in exc_message
+    ):
+        return True
 
     return False
 
@@ -3236,7 +3314,9 @@ class ProxyLogging:
 
         ### ALERTING ###
         await self.update_request_status(litellm_call_id=request_data.get("litellm_call_id", ""), status="fail")
-        if AlertType.llm_exceptions in self.alert_types and not _is_client_error_exception(original_exception):
+        if AlertType.llm_exceptions in self.alert_types and not _is_client_error_exception(
+            original_exception, error_type=error_type
+        ):
             """
             Just alert on LLM API exceptions. Do not alert on user errors
 
