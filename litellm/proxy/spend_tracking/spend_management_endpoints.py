@@ -2481,6 +2481,10 @@ async def ui_view_spend_logs(
         default=None,
         description="request_id to get spend logs for specific request_id",
     ),
+    request_ids: str | None = fastapi.Query(
+        default=None,
+        description="Comma-separated request IDs (max 10000) to filter logs",
+    ),
     session_id: str | None = fastapi.Query(
         default=None,
         description="Filter spend logs by session_id (partial string match)",
@@ -2692,6 +2696,10 @@ async def ui_view_spend_logs(
 
         if request_id is not None:
             where_conditions["request_id"] = request_id
+        elif request_ids is not None:
+            id_list: Final = [rid.strip() for rid in request_ids.split(",") if rid.strip()][:10000]
+            if id_list:
+                where_conditions["request_id"] = {"in": id_list}
 
         if model is not None:
             where_conditions["model"] = model
@@ -2858,6 +2866,10 @@ async def ui_view_spend_logs(
         if isinstance(request_id_filter, str):
             sql_conditions.append(f"(request_id = ${p} OR litellm_call_id = ${p})")
             sql_params.append(request_id_filter)
+            p += 1
+        elif isinstance(request_id_filter, dict) and "in" in request_id_filter:
+            sql_conditions.append(f"request_id = ANY(${p}::text[])")
+            sql_params.append(request_id_filter["in"])
             p += 1
 
         # Multi-team OR filter: (user = $X OR team_id = ANY($Y))
